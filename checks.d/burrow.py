@@ -4,6 +4,8 @@ from urlparse import urljoin
 # 3rd Party
 import requests
 import json
+from threading import Thread
+import time
 
 # project
 from checks import AgentCheck
@@ -38,6 +40,20 @@ class BurrowCheck(AgentCheck):
         self.log.debug("Collecting Consumer Group lags")
         self._consumer_groups_lags(clusters, burrow_address, extra_tags)
 
+    def _chunks(self, l, n):
+        """Yield successive n-sized chunks from l."""
+        for i in xrange(0, len(l), n):
+            yield l[i:i + n]
+
+    def _start_threads_and_wait_for_timeout(self, thread_list, timeout_seconds):
+        for t in thread_list:
+            if not t.is_alive():
+                t.start()
+
+        endTime = time.time() + timeout_seconds
+        for t in thread_list:
+            t.join(endTime - time.time())
+
     def _consumer_groups_lags(self, clusters, burrow_address, extra_tags):
         """
         Retrieve the offsets for all consumer groups in the clusters
@@ -46,22 +62,33 @@ class BurrowCheck(AgentCheck):
         for cluster in clusters:
             consumers_path = "%s/%s/consumer" % (CLUSTER_ENDPOINT, cluster)
             consumers_list = self._rest_request_to_json(burrow_address, consumers_path).get("consumers", [])
-            for consumer in consumers_list:
-                lags_path = "%s/%s/lag" % (consumers_path, consumer)
-                lag_json = self._rest_request_to_json(burrow_address, lags_path)
-                if not lag_json:
-                    continue
-                status = lag_json["status"]
-                consumer_tags = ["cluster:%s" % cluster, "consumer:%s" % consumer] + extra_tags
 
-                self.gauge("kafka.consumer.maxlag", status["maxlag"], tags=consumer_tags)
-                self.gauge("kafka.consumer.totallag", status["totallag"], tags=consumer_tags)
-                self._submit_lag_status("kafka.consumer.lag_status", status["status"], tags=consumer_tags)
+            chunk_size = int(len(consumers_list) / 100) + 1
+            #Will make 10 or 11 threads depending on the length of list.
+            iterables = self._chunks(consumers_list, chunk_size)
+            thread_list = []
+            for consumer_sub_list in iterables:
+                t1 = Thread(target=self._consumer_group_thread_func, args=(burrow_address, extra_tags, consumer_sub_list, consumers_path, cluster))
+                thread_list.append(t1)
+            self._start_threads_and_wait_for_timeout(thread_list, 120)
 
-                for partition in status.get("partitions", []):
-                    partition_tags = consumer_tags + ["topic:%s" % partition["topic"], "partition:%s" % partition["partition"]]
-                    self._submit_partition_lags(partition, partition_tags)
-                    self._submit_lag_status("kafka.consumer.partition_lag_status", partition["status"], tags=partition_tags)
+    def _consumer_group_thread_func(self, burrow_address, extra_tags, consumers_list, consumers_path, cluster):
+        for consumer in consumers_list:
+            lags_path = "%s/%s/lag" % (consumers_path, consumer)
+            lag_json = self._rest_request_to_json(burrow_address, lags_path)
+            if not lag_json:
+                continue
+            status = lag_json["status"]
+            consumer_tags = ["cluster:%s" % cluster, "consumer:%s" % consumer] + extra_tags
+
+            self.gauge("kafka.consumer.maxlag", status["maxlag"], tags=consumer_tags)
+            self.gauge("kafka.consumer.totallag", status["totallag"], tags=consumer_tags)
+            self._submit_lag_status("kafka.consumer.lag_status", status["status"], tags=consumer_tags)
+
+            for partition in status.get("partitions", []):
+                partition_tags = consumer_tags + ["topic:%s" % partition["topic"], "partition:%s" % partition["partition"]]
+                self._submit_partition_lags(partition, partition_tags)
+                self._submit_lag_status("kafka.consumer.partition_lag_status", partition["status"], tags=partition_tags)
 
     def _submit_lag_status(self, metric_namespace, status, tags):
         burrow_status = {
@@ -116,13 +143,24 @@ class BurrowCheck(AgentCheck):
             offsets_topic = self._rest_request_to_json(burrow_address, cluster_path)["cluster"]["offsets_topic"]
             topics_path = "%s/topic" % cluster_path
             topics_list = self._rest_request_to_json(burrow_address, topics_path).get("topics", [])
-            for topic in topics_list:
-                if topic == offsets_topic:
-                    continue
-                topic_path = "%s/%s" % (topics_path, topic)
-                response = self._rest_request_to_json(burrow_address, topic_path)
-                tags = ["topic:%s" % topic, "cluster:%s" % cluster] + extra_tags
-                self._submit_offsets_from_json(offsets_type="topic", json=response, tags=tags)
+
+            chunk_size = int(len(topics_list) / 10)
+            #Will make 10 or 11 threads depending on the length of list.
+            iterables = self._chunks(topics_list, chunk_size)
+            thread_list = []
+            for topic_sub_list in iterables:
+                thread_list.append(Thread(target=self._topic_offsets_thread_func, args=(burrow_address, extra_tags, topic_sub_list, topics_path, cluster, offsets_topic)))
+            self._start_threads_and_wait_for_timeout(thread_list, 120)
+
+
+    def _topic_offsets_thread_func(self, burrow_address, extra_tags, topics_list, topics_path, cluster, offsets_topic):
+        for topic in topics_list:
+            if topic == offsets_topic:
+                continue
+            topic_path = "%s/%s" % (topics_path, topic)
+            response = self._rest_request_to_json(burrow_address, topic_path)
+            tags = ["topic:%s" % topic, "cluster:%s" % cluster] + extra_tags
+            self._submit_offsets_from_json(offsets_type="topic", json=response, tags=tags)
 
     def _consumer_groups_offsets(self, clusters, burrow_address, extra_tags):
         """
@@ -131,17 +169,28 @@ class BurrowCheck(AgentCheck):
         for cluster in clusters:
             consumers_path = "%s/%s/consumer" % (CLUSTER_ENDPOINT, cluster)
             consumers_list = self._rest_request_to_json(burrow_address, consumers_path).get("consumers", [])
-            for consumer in consumers_list:
-                topics_path = "%s/%s/topic" % (consumers_path, consumer)
-                topics_list = self._rest_request_to_json(burrow_address, topics_path).get("topics", [])
-                for topic in topics_list:
-                    topic_path = "%s/%s" % (topics_path, topic)
-                    response = self._rest_request_to_json(burrow_address, topic_path)
-                    if not response:
-                        continue
-                    tags = ["topic:%s" % topic, "cluster:%s" % cluster,
-                            "consumer:%s" % consumer] + extra_tags
-                    self._submit_offsets_from_json(offsets_type="consumer", json=response, tags=tags)
+
+            chunk_size = int(len(consumers_list) / 10)
+            # Will make 10 or 11 threads depending on the length of list.
+            iterables = self._chunks(consumers_list, chunk_size)
+            thread_list = []
+            for consumer_groups_sublist in iterables:
+                thread_list.append(Thread(target=self._consumer_groups_offsets_thread,
+                            args=(burrow_address, extra_tags, consumer_groups_sublist, consumers_path, cluster)))
+            self._start_threads_and_wait_for_timeout(thread_list, 120)
+
+    def _consumer_groups_offsets_thread(self, burrow_address, extra_tags, consumers_list, consumers_path, cluster):
+        for consumer in consumers_list:
+            topics_path = "%s/%s/topic" % (consumers_path, consumer)
+            topics_list = self._rest_request_to_json(burrow_address, topics_path).get("topics", [])
+            for topic in topics_list:
+                topic_path = "%s/%s" % (topics_path, topic)
+                response = self._rest_request_to_json(burrow_address, topic_path)
+                if not response:
+                    continue
+                tags = ["topic:%s" % topic, "cluster:%s" % cluster,
+                        "consumer:%s" % consumer] + extra_tags
+                self._submit_offsets_from_json(offsets_type="consumer", json=response, tags=tags)
 
     def _submit_offsets_from_json(self, offsets_type, json, tags):
         """
